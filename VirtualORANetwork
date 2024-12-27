@@ -1,0 +1,322 @@
+import random
+import matplotlib.pyplot as plt
+import time
+import pandas as pd
+import numpy as np
+import boto3,json,requests
+# random.seed(42)
+
+class RadioUnit:
+    def __init__(self, ru_type, max_capacity, x, y, area):
+        self.ru_type = ru_type
+        self.capacity = max_capacity
+        self.current_load = 0
+        self.x = x
+        self.y = y
+        self.area = area
+        self.power = "Full"
+
+    def connect_user(self, user_load):
+        if self.current_load + user_load <= self.capacity:
+            self.current_load += user_load
+            return True
+        return False
+
+    def disconnect_user(self, user_load):
+        self.current_load -= user_load
+        if self.current_load < 0:
+            self.current_load = 0
+
+    def update_power(self):
+        if self.current_load > 45:
+            self.power = "Full"
+        elif 0 < self.current_load <= 45:
+            self.power = "Reduced"
+        else:
+            self.power = "Idle"
+            
+    def update_power_ai(self, ai_power):
+        if ai_power == 2:
+            self.power = "Full"
+        if ai_power == 1:
+            self.power = "Reduced"
+        if ai_power == 0:
+            self.power = "Idle"
+
+    def __str__(self):
+        return " {} " .format(self.current_load)
+
+class UserEquipment:
+    def __init__(self, user_id, load, x, y, area):
+        self.user_id = user_id
+        self.load = load
+        self.x = x
+        self.y = y
+        self.area = area 
+        self.connected_ru = None
+        self.updated_load = load
+
+    def connect(self, ru):
+        if ru.connect_user(self.updated_load):
+            self.connected_ru = ru
+            return True
+        return False
+
+    def disconnect(self):
+        if self.connected_ru:
+            self.connected_ru.disconnect_user(self.updated_load)
+            self.connected_ru = None
+
+# Define time-based transition probabilities
+def get_time_based_transition(area, hour, day_type):
+    if day_type == "weekday":
+        if 8 <= hour < 18:  # Working hours
+            if area == "Office":
+                return {"Office": 0.7, "Residential": 0.2, "Garden_Mall": 0.1}
+            if area == "Residential":
+                return {"Office": 0.5, "Residential": 0.3, "Garden_Mall": 0.2}
+            if area == "Garden_Mall":
+                return {"Office": 0.4, "Residential": 0.3, "Garden_Mall": 0.3}
+        elif 18 <= hour < 22:  # Evening (post-work hours)
+            if area == "Office":
+                return {"Office": 0.2, "Residential": 0.4, "Garden_Mall": 0.4}
+            if area == "Residential":
+                return {"Office": 0.1, "Residential": 0.6, "Garden_Mall": 0.3}
+            if area == "Garden_Mall":
+                return {"Office": 0.1, "Residential": 0.3, "Garden_Mall": 0.6}
+        else:  # Night (10 PM to 6 AM)
+            if area == "Office":
+                return {"Office": 0.1, "Residential": 0.8, "Garden_Mall": 0.1}
+            if area == "Residential":
+                return {"Office": 0.05, "Residential": 0.9, "Garden_Mall": 0.05}
+            if area == "Garden_Mall":
+                return {"Office": 0.1, "Residential": 0.7, "Garden_Mall": 0.2}
+
+    elif day_type == "weekend":
+        if 10 <= hour < 22:
+            if area == "Office":
+                return {"Office": 0.1, "Residential": 0.4, "Garden_Mall": 0.5}
+            if area == "Residential":
+                return {"Office": 0.05, "Residential": 0.5, "Garden_Mall": 0.45}
+            if area == "Garden_Mall":
+                return {"Office": 0.05, "Residential": 0.3, "Garden_Mall": 0.65}
+        else:  # Night (10 PM to 10 AM)
+            if area == "Office":
+                return {"Office": 0.05, "Residential": 0.85, "Garden_Mall": 0.1}
+            if area == "Residential":
+                return {"Office": 0.02, "Residential": 0.9, "Garden_Mall": 0.08}
+            if area == "Garden_Mall":
+                return {"Office": 0.1, "Residential": 0.75, "Garden_Mall": 0.15}
+
+# Function to calculate distance between a user and an RU
+def distance(ru, ue):
+    return ((ru.x - ue.x) ** 2 + (ru.y - ue.y) ** 2) ** 0.5
+     
+# Create fixed RUs for each area
+macro_rus = [
+    # Office Area (x = 0 to 2500, y = 0 to 5000)
+    RadioUnit("macro", 200, 500, 1500, "Office"),
+    RadioUnit("macro", 200, 500, 3750, "Office"),
+    RadioUnit("macro", 200, 1250, 500, "Office"),
+    RadioUnit("macro", 200, 1250, 2500, "Office"),
+    RadioUnit("macro", 200, 2000, 1500, "Office"),
+    RadioUnit("macro", 200, 2000, 3750, "Office"),
+
+    # Residential Area (x = 2500 to 5000, y = 0 to 5000)
+    RadioUnit("macro", 200, 3000, 1500, "Residential"),
+    RadioUnit("macro", 200, 3000, 3750, "Residential"),
+    RadioUnit("macro", 200, 3750, 500, "Residential"),
+    RadioUnit("macro", 200, 3750, 2500, "Residential"),
+    RadioUnit("macro", 200, 4500, 1500, "Residential"),
+    RadioUnit("macro", 200, 4500, 3750, "Residential"),
+
+    # Garden Mall Area (x = 5000 to 7500, y = 0 to 5000)
+    RadioUnit("macro", 200, 5500, 1500, "Garden_Mall"),
+    RadioUnit("macro", 200, 5500, 3750, "Garden_Mall"),
+    RadioUnit("macro", 200, 6250, 2500, "Garden_Mall"),
+    RadioUnit("macro", 200, 6300, 500, "Garden_Mall"),
+    RadioUnit("macro", 200, 7000, 1500, "Garden_Mall"),
+    RadioUnit("macro", 200, 7000, 3750, "Garden_Mall")
+]
+
+micro_rus = [
+    # Office Area (x = 0 to 2500, y = 0 to 5000)
+    RadioUnit("micro", 150, 750, 1000, "Office"),
+    RadioUnit("micro", 150, 750, 3750, "Office"),
+    RadioUnit("micro", 150, 1000, 4800, "Office"),
+    RadioUnit("micro", 150, 1750, 1000, "Office"),
+    RadioUnit("micro", 150, 1750, 3750, "Office"),
+    RadioUnit("micro", 150, 2000, 4800, "Office"),
+    RadioUnit("micro", 150, 1400, 2500, "Office"),
+
+    # Residential Area (x = 2500 to 5000, y = 0 to 5000)
+    RadioUnit("micro", 150, 3000, 4800, "Residential"),
+    RadioUnit("micro", 150, 3250, 1000, "Residential"),
+    RadioUnit("micro", 150, 3250, 3750, "Residential"),
+    RadioUnit("micro", 150, 4000, 4800, "Residential"),
+    RadioUnit("micro", 150, 4250, 1000, "Residential"),
+    RadioUnit("micro", 150, 4250, 3750, "Residential"),
+    RadioUnit("micro", 150, 4000, 2500, "Residential"),
+    
+    # Garden Mall Area (x = 5000 to 7500, y = 0 to 5000)
+    RadioUnit("micro", 150, 5750, 1000, "Garden_Mall"),
+    RadioUnit("micro", 150, 5750, 3750, "Garden_Mall"),
+    RadioUnit("micro", 150, 6000, 4800, "Garden_Mall"),
+    RadioUnit("micro", 150, 6750, 1000, "Garden_Mall"),
+    RadioUnit("micro", 150, 6750, 3750, "Garden_Mall"),
+    RadioUnit("micro", 150, 6400, 2500, "Garden_Mall"),
+    RadioUnit("micro", 150, 7000, 4800, "Garden_Mall"),
+]
+
+all_rus = macro_rus + micro_rus
+
+# Create users, initially distributed in Residential area
+users = []
+for i in range(100):
+    users.append(UserEquipment(user_id=i, load=random.randint(1, 30), x=random.randint(2500, 5000), y=random.randint(0, 5000), area="Residential"))
+
+# Initialize data collection
+data = []
+user_data = []
+current_time = 0  
+simulation_interval = 60
+
+while current_time < 720:
+    if (current_time // 24) % 7 < 5:
+        day_type = "weekday"
+    else:
+        day_type = "weekend"
+    hour = current_time % 24
+
+    print(f"Simulating Hour: {hour} on {'weekday' if day_type == 'weekday' else 'weekend'}")
+    # Below is to know the user under which Area
+    for user in users:
+        if user.connected_ru:
+            user.disconnect()
+        user.updated_load = user.load
+        transition_probs = get_time_based_transition(user.area, hour, day_type)
+        user.area = random.choices(list(transition_probs.keys()), weights=list(transition_probs.values()))[0]
+        if user.area == "Office":
+            user.x = random.randint(0, 2500)
+            user.y = random.randint(0, 5000)
+        elif user.area == "Residential":
+            if 1 <= hour <= 5:
+                user.updated_load = user.load / 2
+            user.x = random.randint(2500, 5000)
+            user.y = random.randint(0, 5000)
+        elif user.area == "Garden_Mall":
+            user.x = random.randint(5000, 7500)
+            user.y = random.randint(0, 5000)
+
+        closest_ru = None
+        min_distance = float('inf')
+        for ru in all_rus:
+            max_distance = 1500 if ru.ru_type == "micro" else 2500
+            if user.area == "Office" and ru.x <= 2500:
+                dist = distance(ru, user)
+                if dist < min_distance and ru.current_load + user.updated_load <= ru.capacity and dist <= max_distance:
+                    closest_ru = ru
+                    min_distance = dist
+            elif user.area == "Residential" and 2500 < ru.x <= 5000:
+                dist = distance(ru, user)
+                if dist < min_distance and ru.current_load + user.updated_load <= ru.capacity and dist <= max_distance:
+                    closest_ru = ru
+                    min_distance = dist
+            elif user.area == "Garden_Mall" and ru.x > 5000:
+                dist = distance(ru, user)
+                if dist < min_distance and ru.current_load + user.updated_load <= ru.capacity and dist <= max_distance:
+                    closest_ru = ru
+                    min_distance = dist
+        if closest_ru:
+            user.connect(closest_ru)
+        else:
+            if not closest_ru:
+                for ru in all_rus:
+                    dist = distance(ru, user)
+                    if dist < min_distance and dist <= 3000 and ru.current_load + user.updated_load <= ru.capacity:
+                        closest_ru = ru
+                        min_distance = dist
+                if not closest_ru:
+                    for ru in all_rus:
+                        print("Current RU load is {} and RU Type {}".format(ru.current_load, ru.capacity))
+                    print(f"User {user.user_id} with load {user.updated_load} could not connect to any RU.")
+                else:
+                    user.connect(closest_ru)
+        user_data.append({
+            'Day': current_time // 24 + 1,
+            'Hour': hour,
+            'User_id': user.user_id,
+            'User_x': user.x,
+            'User_y': user.y,
+            'User_load': user.load,
+            'User_load_updated': user.updated_load,
+            'User_Area': user.area,
+            'User_RU_Area': closest_ru.area,
+            'Connected_ru_id': id(closest_ru) if user.connected_ru else None,
+            'Connected_ru_type': closest_ru.ru_type if user.connected_ru else None,
+            'Connected_ru_x': closest_ru.x if user.connected_ru else None,
+            'Connected_ru_y': closest_ru.y if user.connected_ru else None,
+            'Distance_to_ru': distance(closest_ru, user) if closest_ru else None
+        })
+    Day_Type = {'weekday': 0, 'weekend': 1}
+    Area = {'Office': 0, 'Residential': 1, 'Garden_Mall': 2}
+    RU_type = {'macro': 0, 'micro': 1}
+    for ru in all_rus:
+        payload = {"parameters":[[Day_Type[day_type], hour,Area[ru.area], RU_type[ru.ru_type], ru.capacity, ru.current_load, (ru.current_load / ru.capacity) * 100]]}
+        api_url = 'https://pdddnvlllk.execute-api.us-east-1.amazonaws.com/FirstStage/api-ml-model'
+        response = requests.post(api_url, json=payload)
+        if response.status_code == 200:
+            response_body = response.json()
+            ru.update_power_ai(response_body)
+    for ru in all_rus:
+        data.append({
+            'Day_Type': 'Weekday' if ((current_time // 24) % 7) < 5 else 'Weekend',
+            'Hour': hour,
+            'Area': ru.area,
+            'RU_id': id(ru),
+            'RU_type': ru.ru_type,
+            'Capacity': ru.capacity,
+            'RU_x': ru.x,
+            'RU_y': ru.y,
+            'Current_load': ru.current_load,
+            'Load_Percentage': (ru.current_load / ru.capacity) * 100,
+            'RU_Power': ru.power
+        })
+
+    # Visualization
+    # plt.figure(figsize=(20, 20))
+    # plt.axvline(x=2500, color='black', linestyle='--') 
+    # plt.axvline(x=5000, color='black', linestyle='--')
+    # plt.text(1250, 5200, 'Office Area', horizontalalignment='center', fontsize=12, color='black')
+    # plt.text(3750, 5200, 'Residential Area', horizontalalignment='center', fontsize=12, color='black')
+    # plt.text(6250, 5200, 'Garden Mall Area', horizontalalignment='center', fontsize=12, color='black')
+    # for ru in all_rus:
+    #     if ru.ru_type == "macro":
+    #         plt.scatter(ru.x, ru.y, c='red', marker='^', s=200)
+    #     else:
+    #         plt.scatter(ru.x, ru.y, c='blue', marker='o', s=100)
+    # for user in users:
+    #     plt.scatter(user.x, user.y, c='green', marker='x', s=50)
+    #     if user.connected_ru:
+    #         plt.plot([user.x, user.connected_ru.x], [user.y, user.connected_ru.y], color='gray', linestyle='--')
+    # plt.xlabel("X Coordinate")
+    # plt.ylabel("Y Coordinate")
+    # plt.title(f"Virtual Network Layout at Hour {hour}")
+    # plt.grid(True)
+    # plt.show()
+
+    total_user_load = sum(user.updated_load for user in users)
+    total_ru_load = sum(ru.current_load for ru in all_rus)
+
+    if total_user_load != total_ru_load:
+        print(f"Warning: Load mismatch! Total User Load: {total_user_load}, Total RU Load: {total_ru_load}")
+    else:
+        print(f"Load is consistent: {total_ru_load}")
+
+    current_time += 1
+
+# Save collected data to CSV file after the simulation
+df = pd.DataFrame(data)
+df.to_csv('network_simulation_data.csv', index=False)
+df = pd.DataFrame(user_data)
+df.to_csv('user_network_simulation_data.csv', index=False)
