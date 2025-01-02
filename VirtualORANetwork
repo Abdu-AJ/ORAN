@@ -4,7 +4,6 @@ import time
 import pandas as pd
 import numpy as np
 import boto3,json,requests
-# random.seed(42)
 
 class RadioUnit:
     def __init__(self, ru_type, max_capacity, x, y, area):
