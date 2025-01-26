@@ -172,7 +172,7 @@ all_rus = macro_rus + micro_rus
 # Create users, initially distributed in Residential area
 users = []
 for i in range(100):
-    users.append(UserEquipment(user_id=i, load=random.randint(1, 30), x=random.randint(2500, 5000), y=random.randint(0, 5000), area="Residential"))
+    users.append(UserEquipment(user_id=i, load=random.randint(1, 20), x=random.randint(2500, 5000), y=random.randint(0, 5000), area="Residential"))
 
 # Initialize data collection
 data = []
@@ -264,9 +264,11 @@ while current_time < 720:
         payload = {"parameters":[[Day_Type[day_type], hour,Area[ru.area], RU_type[ru.ru_type], ru.capacity, ru.current_load, (ru.current_load / ru.capacity) * 100]]}
         api_url = 'https://pdddnvlllk.execute-api.us-east-1.amazonaws.com/FirstStage/api-ml-model'
         response = requests.post(api_url, json=payload)
-        if response.status_code == 200:
-            response_body = response.json()
+        response_body = response.json()
+        if response_body >0:
             ru.update_power_ai(response_body)
+        else:
+            ru.update_power()
     for ru in all_rus:
         data.append({
             'Day_Type': 'Weekday' if ((current_time // 24) % 7) < 5 else 'Weekend',
@@ -313,6 +315,12 @@ while current_time < 720:
         print(f"Load is consistent: {total_ru_load}")
 
     current_time += 1
+
+# Save collected data to CSV file after the simulation
+# df = pd.DataFrame(data)
+# df.to_csv('network_simulation_data.csv', index=False)
+# df = pd.DataFrame(user_data)
+# df.to_csv('user_network_simulation_data.csv', index=False)
 
 # Save collected data to CSV file after the simulation
 df = pd.DataFrame(data)
